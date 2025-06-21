@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List, Sequence
 from enum import Enum, auto
 import math
+import copy
 
 # Precomputed CABAC tables from HM's ContextModel.cpp (FAST_BIT_EST path)
 # Each entry corresponds to 15-bit fixed point fractional bits.
@@ -349,8 +350,19 @@ class CabacEstimator:
         """Return termination and alignment overhead for a frame."""
         return 8.0
 
-    def estimate_block_bits(self, coeffs: Sequence[Sequence[int]]) -> float:
-        """Estimate bits for a quantized block and update contexts."""
+    def estimate_block_bits(self, coeffs: Sequence[Sequence[int]], update: bool = True) -> float:
+        """Estimate bits for a quantized block.
+
+        Parameters
+        ----------
+        coeffs : Sequence[Sequence[int]]
+            量化后的系数矩阵。
+        update : bool, optional
+            若为 ``True`` (默认) 则在估计过程中更新内部上下文；
+            否则仅计算比特数而不改变上下文状态。
+        """
+        if not update:
+            backup = copy.deepcopy(self.ctx_sets)
         self.start_tu()
         h = len(coeffs)
         w = len(coeffs[0])
@@ -440,6 +452,8 @@ class CabacEstimator:
 
                 if idx == last_idx:
                     ctx_set["k"] = k
+                    if not update:
+                        self.ctx_sets = backup
                     return total_bits
 
             c1 = 1
@@ -448,6 +462,8 @@ class CabacEstimator:
             c2_idx = 0
 
         ctx_set["k"] = k
+        if not update:
+            self.ctx_sets = backup
         return total_bits
 
 if __name__ == "__main__":

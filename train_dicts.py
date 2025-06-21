@@ -9,6 +9,7 @@ import argparse
 import pathlib
 import warnings
 import math
+from CABAC_Estimator import CabacEstimator
 
 import joblib
 import numpy as np
@@ -19,141 +20,6 @@ from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-# ------------------------------------------------------------
-# 简化版 HEVC CABAC 比特数估计器
-# ------------------------------------------------------------
-class HevcCabacEstimator:
-    def __init__(self):
-        self.init_scan_tables()
-
-    # ---------------- 内部辅助 ----------------
-    def init_scan_tables(self):
-        self.diag_scan_4x4 = [
-            0, 1, 4, 8, 5, 2, 3, 6,
-            9, 12, 13, 10, 7, 11, 14, 15
-        ]
-        self.diag_scan_8x8 = self._generate_diag_scan(8)
-
-    def _generate_diag_scan(self, size: int):
-        scan_order = []
-        for sum_val in range(2 * size - 1):
-            if sum_val < size:
-                y = sum_val
-                x = 0
-            else:
-                y = size - 1
-                x = sum_val - size + 1
-            while x < size and y >= 0:
-                if x < size and y < size:
-                    scan_order.append(y * size + x)
-                x += 1
-                y -= 1
-        return scan_order
-
-    # ---------------- 估计子函数 ----------------
-    @staticmethod
-    def estimate_entropy_bits(prob_lps: float) -> float:
-        if prob_lps <= 0.0 or prob_lps >= 1.0:
-            return 0.0
-        prob_mps = 1.0 - prob_lps
-        return -prob_lps * math.log2(prob_lps) - prob_mps * math.log2(prob_mps)
-
-    def estimate_sig_coeff_flag(self, coeff: int, pos_x: int, pos_y: int,
-                                log2_blk_size: int) -> float:
-        if coeff == 0:
-            return 0.0
-        return self.estimate_entropy_bits(0.5)   # 简化：固定 0.5
-
-    def estimate_last_sig_pos(self, last_x: int, last_y: int,
-                              log2_blk_size: int) -> float:
-        bits = 0.0
-        # x 方向
-        if last_x > 3:
-            bits += 3.0
-            bits += math.ceil(math.log2(last_x - 3 + 1))
-        else:
-            bits += last_x * 0.5
-        # y 方向
-        if last_y > 3:
-            bits += 3.0
-            bits += math.ceil(math.log2(last_y - 3 + 1))
-        else:
-            bits += last_y * 0.5
-        return bits
-
-    def estimate_coeff_level(self, abs_level: int, pos_in_cg: int,
-                             first_c2_flag_idx: int) -> float:
-        bits = 0.0
-        if abs_level > 0:
-            bits += 0.8            # coeff_abs_sign_flag
-            if abs_level > 1 and pos_in_cg == first_c2_flag_idx:
-                bits += 0.7        # coeff_abs_level_greater1_flag
-                if abs_level > 2:
-                    remain = abs_level - 3
-                    if remain < 4:
-                        bits += 2.0
-                    else:
-                        bits += 2.0 + math.ceil(math.log2(remain - 3))
-            elif abs_level == 2 and pos_in_cg == first_c2_flag_idx:
-                bits += 0.7
-            bits += 1.0             # sign bit
-        return bits
-
-    # ---------------- 主函数：整块估计 ----------------
-    def estimate_residual_block(self, coeffs: np.ndarray,
-                                log2_blk_size: int) -> float:
-        blk_size = 1 << log2_blk_size
-        total_bits = 0.0
-        if np.all(coeffs == 0):
-            return 1.0              # 仅 coded_block_flag
-        total_bits += 1.0           # coded_block_flag
-
-        # 选扫描顺序
-        if blk_size == 4:
-            scan_order = self.diag_scan_4x4
-        elif blk_size == 8:
-            scan_order = self.diag_scan_8x8
-        else:
-            scan_order = self._generate_diag_scan(blk_size)
-
-        coeffs_1d = coeffs.flatten()[scan_order]
-        # 找最后一个非零
-        last_nz_pos = -1
-        for i in range(len(coeffs_1d) - 1, -1, -1):
-            if coeffs_1d[i] != 0:
-                last_nz_pos = i
-                break
-        if last_nz_pos < 0:
-            return total_bits
-
-        last_flat_idx = scan_order[last_nz_pos]
-        last_y = last_flat_idx // blk_size
-        last_x = last_flat_idx % blk_size
-        total_bits += self.estimate_last_sig_pos(last_x, last_y, log2_blk_size)
-
-        cg_size = 4
-        first_c2_flag_idx = -1
-        for scan_pos in range(last_nz_pos, -1, -1):
-            flat_idx = scan_order[scan_pos]
-            pos_y = flat_idx // blk_size
-            pos_x = flat_idx % blk_size
-            abs_level = abs(int(coeffs_1d[scan_pos]))
-
-            if scan_pos < last_nz_pos:
-                total_bits += self.estimate_sig_coeff_flag(
-                    abs_level, pos_x, pos_y, log2_blk_size
-                )
-
-            if abs_level > 0:
-                pos_in_cg = (pos_y % cg_size) * cg_size + (pos_x % cg_size)
-                if first_c2_flag_idx < 0:
-                    first_c2_flag_idx = pos_in_cg
-                total_bits += self.estimate_coeff_level(
-                    abs_level, pos_in_cg, first_c2_flag_idx
-                )
-
-        return total_bits
-
 # -----------------------------------------------------------------------------
 # —— 辅助函数：（与原脚本保持一致，略去已知易错句）
 #    video_to_residual_blocks, omp, quantize,
@@ -346,9 +212,8 @@ def iter_rd_multicsvd_train(X_train,
         return D
 
     # ---------- 预备变量 ----------
-    m         = blk * blk
-    log2_blk  = int(math.log2(blk))
-    est       = HevcCabacEstimator()
+    m = blk * blk
+    est = CabacEstimator()
     dict_bits = math.ceil(math.log2(num_dicts))
     rng       = np.random.default_rng(0)
 
@@ -403,8 +268,8 @@ def iter_rd_multicsvd_train(X_train,
                 rec = D @ (A_i * quant)
                 err = float(norm(x - rec.reshape(x.shape)))**2
 
-                bits_est = est.estimate_residual_block(
-                    A_i.reshape((blk, blk)), log2_blk_size=log2_blk
+                bits_est = est.estimate_block_bits(
+                    A_i.reshape((blk, blk)), update=False
                 )
                 if np.any(A_i != 0):
                     bits_est += dict_bits
@@ -416,6 +281,7 @@ def iter_rd_multicsvd_train(X_train,
 
             # 只保留非全零块
             if np.any(best_Ai != 0):
+                est.estimate_block_bits(best_Ai.reshape((blk, blk)), update=True)
                 new_labels.append(best_idx)
                 keep_indices.append(i)
 
