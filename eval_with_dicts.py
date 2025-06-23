@@ -152,7 +152,8 @@ def main():
     args=ap.parse_args()
 
     # 1) 准备
-    out_root=pathlib.Path(args.output_dir); out_root.mkdir(exist_ok=True)
+    out_root=pathlib.Path(args.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
     blk=args.block; w=args.width; h=args.height
     X_test=video_to_residual_blocks(
         args.test_video,args.test_frames,blk,
