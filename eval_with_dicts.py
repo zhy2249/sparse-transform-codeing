@@ -148,7 +148,7 @@ def main():
     ap.add_argument("--cabac_exe",default="CABAC.exe")
     ap.add_argument("--tu_cfg",default="TU8.cfg")
     ap.add_argument("--skip_schemes",nargs="*",default=[],
-                    choices=["DCT","MTS","KSVD","MultiKSVD","IterMultiKSVD"])
+                    choices=["DCT","KLT","MTS","KSVD","MultiKSVD","IterMultiKSVD"])
     args=ap.parse_args()
 
     # 1) 准备
@@ -240,6 +240,61 @@ def main():
         psnr_all  = 10 * math.log10((255**2) / mse_all)
         bpp_all   = total_bits / total_pixels
         results.append(["DCT_overall", args.qp,
+                        f"{psnr_all:.3f}", f"{bpp_all:.6f}"])
+
+    # ---------- KLT 单字典（按帧处理） ----------
+    if "KLT" not in args.skip_schemes:
+        print("Evaluating KLT …")
+        D_klt = np.load(str(pathlib.Path(args.dict_dir) / "KLT.npy"))
+
+        total_bits = 0
+        total_err = 0.0
+
+        for frame_idx in range(args.test_frames):
+            X_frame = video_to_residual_blocks(
+                args.test_video, 1, blk,
+                args.residual_offset, w, h,
+                skip=args.skip_frames + frame_idx
+            )
+            Nblocks_f = X_frame.shape[1]
+            sum_err_f = 0.0
+            coeffs_f = []
+
+            for i in range(Nblocks_f):
+                x = X_frame[:, i:i + 1]
+                Ar = D_klt.T @ x
+                Ai = quantize(Ar, args.quant)
+                rec = D_klt @ (Ai * args.quant)
+                err = float(norm(x - rec.reshape(x.shape))) ** 2
+                sum_err_f += err
+                coeffs_f.append(Ai.flatten().tolist())
+
+            out_dir = out_root / f"QP={args.qp}" / "KLT" / f"frame_{frame_idx}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            coeff_path = out_dir / f"coeffs_{frame_idx}.txt"
+            with open(coeff_path, "w") as f:
+                for vec in coeffs_f:
+                    f.write(" ".join(str(int(v)) for v in vec) + "\n")
+
+            bin_path = out_dir / f"out_{frame_idx}.bin"
+            bits_f = run_cabac(str(coeff_path), str(bin_path),
+                               w, h, args.cabac_exe, args.tu_cfg)
+
+            pixels_f = Nblocks_f * blk * blk
+            mse_f = sum_err_f / pixels_f
+            psnr_f = 10 * math.log10((255 ** 2) / mse_f) if mse_f > 0 else float('inf')
+            bpp_f = bits_f / pixels_f
+
+            total_bits += bits_f
+            total_err += sum_err_f
+            results.append([f"KLT_f{frame_idx}", args.qp,
+                            f"{psnr_f:.3f}", f"{bpp_f:.6f}"])
+
+        total_pixels = args.test_frames * (w // blk) * (h // blk) * (blk * blk)
+        mse_all = total_err / total_pixels
+        psnr_all = 10 * math.log10((255 ** 2) / mse_all) if mse_all > 0 else float('inf')
+        bpp_all = total_bits / total_pixels
+        results.append(["KLT_overall", args.qp,
                         f"{psnr_all:.3f}", f"{bpp_all:.6f}"])
 
     # ---------- MTS 多字典（按帧处理 & 记录全帧信息） ----------
